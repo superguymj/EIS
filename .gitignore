@@ -1,0 +1,10 @@
+# Local input data and root-level hidden files/directories.
+/dataset/
+/.*
+!/.gitignore
+
+# Generated Python / Numba caches (including inside source snapshots).
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi

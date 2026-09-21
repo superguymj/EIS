@@ -1,0 +1,6 @@
+# Exact package versions used for the recorded Windows / Python 3.13.9 runs.
+numpy==2.3.5
+scipy==1.16.3
+numba==0.62.1
+matplotlib==3.10.6
+pytest==8.4.2
