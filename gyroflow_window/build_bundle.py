@@ -22,6 +22,11 @@ def main():
     parser.add_argument("--future", type=int, default=15)
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
+    parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
+                        help="Prefer a level horizon using the existing FOV feedback")
+    parser.add_argument("--horizon-up", type=float, nargs=3, default=(0.0, 1.0, 0.0),
+                        metavar=("X", "Y", "Z"),
+                        help="World vertical that should align with camera +Y (default: 0 1 0)")
     args = parser.parse_args()
     loaded = np.load(args.input, allow_pickle=False)
     if isinstance(loaded, np.lib.npyio.NpzFile):
@@ -29,7 +34,8 @@ def main():
             raw = loaded["raw" if "raw" in loaded else "orientations"].copy()
     else:
         raw = loaded
-    config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov)
+    config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov,
+                             enablehorizon=args.enablehorizon, horizon_up=args.horizon_up)
     window = WindowConfig(history=args.history, emit=args.emit, future=args.future)
     result = stabilize_window(raw, config, window, PinholeCamera(args.diagonal_fov))
     output = Path(args.output)

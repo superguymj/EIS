@@ -251,7 +251,7 @@ def project_to_fov(raw, smooth, minimum_fov, camera, iterations=30):
     return result, bad
 
 
-# Source: gyroflow_global.py; SHA256: 19659614d1548824ffc9c20f9822bd5fd92f6b87a6c90c24d32d40aa47a95c99
+# Source: gyroflow_global.py; SHA256: 5b9ce8232853df6c78232deca29f9d5ba46269242dcb877f2a57b0cec4f5f403
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Default algorithm derived from Gyroflow, Copyright 2021-2022 Aphobius.
@@ -261,8 +261,9 @@ def project_to_fov(raw, smooth, minimum_fov, camera, iterations=30):
 
 Includes DefaultAlgo's two forward/backward SLERP passes, distance weighting,
 EnvelopeFollower zoom, and the original finite zoom-feedback iterations.
-Excludes horizon lock, lens distortion, rolling shutter, keyframes, retiming,
-and trim ranges. The shared pinhole camera replaces Gyroflow's image geometry.
+Optional horizon correction is a workspace extension, disabled by default.
+Excludes lens distortion, rolling shutter, keyframes, retiming, and trim ranges.
+The shared pinhole camera replaces Gyroflow's image geometry.
 """
 
 from dataclasses import dataclass
@@ -278,6 +279,8 @@ class SmoothingConfig:
     zoom_seconds: float = 4.0
     minimum_fov: float = 0.8
     max_iterations: int = 5
+    enablehorizon: bool = False
+    horizon_up: tuple[float, float, float] = (0.0, 1.0, 0.0)
 
     def __post_init__(self):
         for name in ['fps', 'smoothness', 'slow_seconds', 'fast_seconds', 'zoom_seconds']:
@@ -290,6 +293,56 @@ class SmoothingConfig:
             raise ValueError('minimum_fov must be in (0, 1]')
         if not isinstance(self.max_iterations, int) or self.max_iterations < 0:
             raise ValueError('max_iterations must be a nonnegative integer')
+        if not isinstance(self.enablehorizon, bool):
+            raise ValueError('enablehorizon must be a boolean')
+        up = np.asarray(self.horizon_up, dtype=np.float64)
+        if up.shape != (3,) or not np.isfinite(up).all() or not np.any(up):
+            raise ValueError('horizon_up must be a finite, nonzero 3-vector')
+        # Normalize without overflowing on large, finite vectors; freeze a copy.
+        up = up / np.max(np.abs(up))
+        up /= np.linalg.norm(up)
+        object.__setattr__(self, 'horizon_up', tuple(float(v) for v in up))
+
+
+def horizon_gain(feedback):
+    """Map the existing finite feedback to a bounded, soft horizon preference.
+
+    h(c)=2c/(1+c) retains more correction than c inside (0,1), while still
+    releasing it at zero. No separate horizon feedback state is maintained.
+    """
+    feedback = np.asarray(feedback, dtype=np.float64)
+    if not np.isfinite(feedback).all():
+        raise ValueError('horizon feedback must be finite')
+    c = np.clip(feedback, 0.0, 1.0)
+    return 2.0 * c / (1.0 + c)
+
+
+def _apply_horizon(poses, config, feedback):
+    """Correct image roll about local +Z, preserving the optical axis.
+
+    Camera +Y should agree with the supplied world vertical. Taper the correction
+    near a vertical optical axis and near an ambiguous half turn. This stateless
+    best-effort policy does not attempt to make upside-down footage upright.
+    """
+    if not config.enablehorizon or len(poses) == 0:
+        return poses
+    gain = horizon_gain(feedback)
+    vertical = np.einsum('nji,j->ni', matrices(poses), config.horizon_up)
+    visibility = np.hypot(vertical[:, 0], vertical[:, 1])
+    angle = np.arctan2(-vertical[:, 0], vertical[:, 1])
+
+    # Suppress ill-defined leveling within 5 degrees of a pole; fully enable it
+    # beyond 10 degrees. Smoothstep avoids a hard on/off threshold in the pose.
+    pole = np.clip((visibility - np.sin(np.deg2rad(5.0))) /
+                   (np.sin(np.deg2rad(10.0)) - np.sin(np.deg2rad(5.0))), 0.0, 1.0)
+    pole = pole * pole * (3.0 - 2.0 * pole)
+    # Partial shortest-arc correction has a branch cut at +/-180 degrees.
+    # Fade between 150 and 180 degrees, so crossing the cut stays continuous.
+    turn = np.clip((np.pi - np.abs(angle)) / np.deg2rad(30.0), 0.0, 1.0)
+    turn = turn * turn * (3.0 - 2.0 * turn)
+    correction = np.zeros((len(poses), 3))
+    correction[:, 2] = angle * gain * pole * turn
+    return multiply(poses, from_rotvec(correction))
 
 
 @dataclass
@@ -307,6 +360,8 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     Returns (poses, diagnostics). Scalar/vector feedback corresponds to
     smoothing_fov_limit_per_frame, sampled here at the same fixed video FPS.
     duration_ms=N/fps*1000 reproduces the source's N/duration sample rate.
+    Optional horizon correction shares this feedback and runs on every nonempty
+    return path, before the caller evaluates geometry and updates feedback.
     """
     q = np.ascontiguousarray(q, dtype=np.float64)
     if len(q) == 0:
@@ -329,7 +384,7 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         if maximum == 0.0:
             # Rust 0/0 -> NaN; f64::min(NaN, 1) -> 1, so pass two is identity.
-            return first, {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
         distance = distance / maximum
     else:
         distance = np.clip(distance / max(float(distance_scale), 1e-8), 0, 1)
@@ -338,12 +393,12 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         normalizer = float(np.max(distance[:norm_end]))
         if normalizer == 0.0:
-            return first, {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
         distance /= normalizer
     distance = (distance + 1) / 2
     alpha_second = np.minimum(1.0, a_s + (a_f-a_s) * ratio * distance)
     second = quaternion_forward_backward(first, alpha_second)
-    return second, {'distance_max': maximum, 'first_distance': first_distance}
+    return _apply_horizon(second, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
 
 
 def zoom_curve(geometric, config):
@@ -690,6 +745,11 @@ def main():
     parser.add_argument("--future", type=int, default=15)
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
+    parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
+                        help="Prefer a level horizon using the existing FOV feedback")
+    parser.add_argument("--horizon-up", type=float, nargs=3, default=(0.0, 1.0, 0.0),
+                        metavar=("X", "Y", "Z"),
+                        help="World vertical that should align with camera +Y (default: 0 1 0)")
     args = parser.parse_args()
     loaded = np.load(args.input, allow_pickle=False)
     if isinstance(loaded, np.lib.npyio.NpzFile):
@@ -697,7 +757,8 @@ def main():
             raw = loaded["raw" if "raw" in loaded else "orientations"].copy()
     else:
         raw = loaded
-    config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov)
+    config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov,
+                             enablehorizon=args.enablehorizon, horizon_up=args.horizon_up)
     window = WindowConfig(history=args.history, emit=args.emit, future=args.future)
     result = stabilize_window(raw, config, window, PinholeCamera(args.diagonal_fov))
     output = Path(args.output)

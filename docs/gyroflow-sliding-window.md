@@ -4,6 +4,8 @@
 
 主交付是 [单文件版本](../dist/gyroflow_sliding_window.py)。详细实测表、不同 FOV 和 F 下的结果以及最差案例见 [实验结果](gyroflow-sliding-window-results.md)。原版算法的逐步分析见 [Global 平滑与缩放迭代说明](gyroflow-global-smoothing-and-zoom-limit.md)。
 
+新增的 `SmoothingConfig.enablehorizon` 可让候选姿态优先向水平靠拢，并复用现有缩放反馈。开关默认关闭，创建流实例后保持固定。逐文件改动、反馈映射、坐标约定和接入方式见 [horizon 功能修改说明](gyroflow-horizon.md)。已有实验结果对应关闭此功能的算法。
+
 ## 1. 交付内容与适用范围
 
 | 内容 | 文件 |
@@ -20,7 +22,7 @@
 
 Global 对照基于 Gyroflow 提交 `2331ebb3c253fc7cf357642518b0c8bf2937f815`，移植了默认不分轴平滑、两轮前后向 SLERP、角速度与偏差权重、EnvelopeFollower 缩放，以及默认最多 5 次的缩放反馈。
 
-实验采用固定参数、固定帧率，每个视频帧一个姿态四元数。它不包含传感器积分、真实镜头畸变、滚动快门、地平线锁定、关键帧、变速和裁剪区间处理。Global 与窗口版本共用同一个精确针孔几何模型，确保比较时几何条件一致。
+实验采用固定参数、固定帧率，每个视频帧一个姿态四元数，原实验关闭 horizon 功能。实现不包含传感器积分、真实镜头畸变、滚动快门、关键帧、变速和裁剪区间处理；新增 horizon 使用调用方指定的世界竖直方向。Global 与窗口版本共用同一个精确针孔几何模型，确保比较时几何条件一致。
 
 四元数平滑核心还与独立的 SciPy Rotation 标量实现进行了数值核对。这属于源码移植核对和独立运算实现验证；本环境没有编译运行完整 Gyroflow Rust 引擎。
 
@@ -266,6 +268,8 @@ for batch in stream.flush():
 | `hard_fov` | True | 最后进行几何可行性投影 |
 | `SmoothingConfig.minimum_fov` | 0.8 | (0,1]；无量纲视野保留底线 |
 | `SmoothingConfig.max_iterations` | 5 | 初始平滑之后最多反馈重算次数 |
+| `SmoothingConfig.enablehorizon` | False | 创建实例时固定；启用共享反馈控制的水平矫正 |
+| `SmoothingConfig.horizon_up` | (0, 1, 0) | 期望与相机 +Y 对齐的世界竖直方向；自动归一化 |
 
 Global 基础滤波参数默认 `smoothness=0.5`、`slow_seconds=1.0`、`fast_seconds=0.1`、`zoom_seconds=4.0`。改变这些参数会改变候选轨迹，也可能需要重新评估预测长度和 H/F。
 

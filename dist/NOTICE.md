@@ -11,9 +11,12 @@ translations of Gyroflow commit `2331ebb3c253fc7cf357642518b0c8bf2937f815`.
   See the accompanying LICENSE file for the full license text.
 
 The synthetic pinhole geometry, bounded streaming adapter, boundary fitting,
-tail prediction, synthetic data, and experiments are additions in this workspace.
+tail prediction, optional feedback-controlled horizon correction, synthetic data,
+and experiments are additions in this workspace.
 They are not an official Gyroflow implementation of streaming stabilization.
 
 The baseline supports constant parameters and the non-per-axis default algorithm.
 It does not reproduce Gyroflow's complete calibrated image transform, rolling
-shutter correction, integration, horizon lock, keyframes, retiming, or trim logic.
+shutter correction, integration, full horizon-lock behavior, keyframes, retiming,
+or trim logic. The optional horizon correction uses an explicit world vertical
+and the existing zoom feedback; it does not estimate gravity from IMU samples.
