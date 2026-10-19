@@ -1,10 +1,10 @@
 # Gyroflow 滑动窗口平滑：实现、实验与接入说明
 
-本项目提供一个 Global Python 对照、一个严格限制真实前瞻的滑动窗口实现，以及可复现的合成数据实验。窗口算法经过六轮开发对照和一次扩展场景诊断后冻结，再使用未参与调参的随机种子进行最终验证。前一次诊断发现问题后用于继续开发，不算最终独立验证。
+本项目提供一个 Global Python 对照、一个严格限制真实前瞻的滑动窗口实现，以及可复现的合成数据实验。关闭 horizon 的窗口基线经过六轮开发对照和一次扩展场景诊断后冻结，再使用未参与调参的随机种子进行最终验证。前一次诊断发现问题后用于继续开发，不算最终独立验证。
 
 主交付是 [单文件版本](../dist/gyroflow_sliding_window.py)。详细实测表、不同 FOV 和 F 下的结果以及最差案例见 [实验结果](gyroflow-sliding-window-results.md)。原版算法的逐步分析见 [Global 平滑与缩放迭代说明](gyroflow-global-smoothing-and-zoom-limit.md)。
 
-新增的 `SmoothingConfig.enablehorizon` 可让候选姿态优先向水平靠拢，并复用现有缩放反馈。开关默认关闭，创建流实例后保持固定。逐文件改动、反馈映射、坐标约定和接入方式见 [horizon 功能修改说明](gyroflow-horizon.md)。已有实验结果对应关闭此功能的算法。
+`SmoothingConfig.enablehorizon` 开启覆盖约束下的水平矫正。2026-10-16 的修复保留缩放 feedback，生成完整水平目标，在接缝后恢复水平，并通过视线与残余 roll 分开处理的可行性搜索保证 FOV。开关默认关闭，创建流实例后保持固定。算法、真实视频 FOV=0.6 的三轴曲线和验收见 [horizon 功能说明](gyroflow-horizon.md)。原有合成实验结果对应关闭此功能的算法。
 
 ## 1. 交付内容与适用范围
 
@@ -63,11 +63,12 @@ flowchart TD
     A["H 帧真实历史 + E/F 帧真实输入"] --> B["仅根据已观测数据预测虚拟尾部"]
     B --> C["Gyroflow 两轮双向平滑，生成候选轨迹"]
     C --> D["固定历史，修正接缝及角速度变化"]
-    D --> G["逐帧覆盖检查 + 缩放曲线"]
+    D --> L["开启 horizon 时恢复正常方向的水平目标"]
+    L --> G["逐帧覆盖检查 + 缩放曲线"]
     G --> I{"超出缩放目标且尚可迭代？"}
     I -->|是| J["只降低 E/F 的反馈系数"]
     J --> C
-    I -->|否| P["对仍不可行的位姿做精确 FOV 投影"]
+    I -->|否| P["FOV 投影：horizon 开启时使用保持水平的可行路径"]
     P --> Z["重新检查几何与缩放，衔接历史缩放"]
     Z --> O["只提交 E 帧，滑动 E 帧"]
 ```
@@ -165,6 +166,8 @@ S(t)=\operatorname{SLERP}(Q_{\mathrm{raw}},S_{\mathrm{candidate}},t),\qquad t\in
 $$
 
 原始姿态在本实验相机模型下对应 FOV=1，是可行起点。30 次二分搜索始终保留一个已验证可行的端点，最后再检查一次几何条件。浮点检查仍不满足时回退到原始姿态。
+
+开启 horizon 时，使用 `project_horizon_to_fov()`：从已验证可行的锚点向水平目标调整视线，并单独插值残余 roll，避免整姿态回退重新带入倾斜。完整水平与裁剪底线冲突时仍保留必要倾斜；退化方向继续使用普通投影。feedback 迭代始终保留，详见 [具体算法与实测](gyroflow-horizon.md)。
 
 这保证的是当前针孔模型下的画面覆盖及设定底线。搜索不声称找到了整个旋转弧上全部可能可行区间中的全局最优点。投影可能增加运动残留或加速度，这种代价应通过实测指标判断。
 
@@ -268,7 +271,7 @@ for batch in stream.flush():
 | `hard_fov` | True | 最后进行几何可行性投影 |
 | `SmoothingConfig.minimum_fov` | 0.8 | (0,1]；无量纲视野保留底线 |
 | `SmoothingConfig.max_iterations` | 5 | 初始平滑之后最多反馈重算次数 |
-| `SmoothingConfig.enablehorizon` | False | 创建实例时固定；启用共享反馈控制的水平矫正 |
+| `SmoothingConfig.enablehorizon` | False | 创建实例时固定；保留反馈并启用覆盖约束下的水平目标与最终投影 |
 | `SmoothingConfig.horizon_up` | (0, 1, 0) | 期望与相机 +Y 对齐的世界竖直方向；自动归一化 |
 
 Global 基础滤波参数默认 `smoothness=0.5`、`slow_seconds=1.0`、`fast_seconds=0.1`、`zoom_seconds=4.0`。改变这些参数会改变候选轨迹，也可能需要重新评估预测长度和 H/F。

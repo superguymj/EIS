@@ -1,0 +1,77 @@
+{
+  "video": "dataset/insta360/20260826_195214/PRO_VID_20260826_195214_00_052.mp4",
+  "video_sha256": "1d331512343439761ddc93c3ef16d78825e6b6b6243f5a49d3c9a9faa5af0e83",
+  "original_pose_source": "Gyroflow original camera export from source MP4 IMU",
+  "smoothed_pose_source": "gyroflow_window.sliding_window.stabilize_window",
+  "frame_count": 220,
+  "fps": 29.97002997002986,
+  "plotted_duration_s": 7.307300000000001,
+  "world_basis_change": "Q = Rx(-90 degrees) * Q_gyroflow; maps world +Z to +Y",
+  "euler_convention": "intrinsic YXZ: Q = Ry(yaw) Rx(pitch) Rz(roll); degrees",
+  "curve_processing": "360-degree unwrap only; no extra filtering or independent zeroing",
+  "smoothing_config": {
+    "fps": 29.97002997002986,
+    "smoothness": 0.5,
+    "slow_seconds": 1.0,
+    "fast_seconds": 0.1,
+    "zoom_seconds": 4.0,
+    "minimum_fov": 0.6,
+    "max_iterations": 5,
+    "enablehorizon": true,
+    "horizon_up": [
+      0.0,
+      1.0,
+      0.0
+    ]
+  },
+  "window_config": {
+    "history": 60,
+    "emit": 6,
+    "future": 15,
+    "boundary_weight": 1.0,
+    "prediction_seconds": 1.5,
+    "prediction_decay_seconds": 0.6,
+    "prediction_fit_seconds": 0.6,
+    "prediction_guard_seconds": 1.2,
+    "prediction_endpoint_fit": true,
+    "adaptive_boundary": true,
+    "stable_distance_scale": false,
+    "initial_distance_deg": 3.0,
+    "hard_fov": true
+  },
+  "camera_model": {
+    "diagonal_fov_deg": 100.0,
+    "aspect": 1.7777777777777777,
+    "note": "package pinhole model; not calibrated lens rendering"
+  },
+  "roll_rms_deg": {
+    "raw": 11.01681277189078,
+    "smoothed": 3.430927246079238e-15
+  },
+  "pitch_yaw_second_difference_rms_deg": {
+    "raw": [
+      4.882753631101813,
+      4.829048477550847
+    ],
+    "smoothed": [
+      1.976057111092077,
+      1.7507485801974303
+    ]
+  },
+  "feedback": {
+    "enabled": true,
+    "iterations": 115,
+    "minimum": 0.27284205168615394
+  },
+  "projected_frames": 16,
+  "validation": {
+    "max_exported_quaternion_norm_error": 1.8400364565351879e-09,
+    "max_euler_reconstruction_error_rad": 1.0817777879298014e-15,
+    "max_euler_roll_vs_projected_vertical_error_deg": 5.684341886080802e-14,
+    "minimum_output_fov": 0.6000000200052833,
+    "minimum_coverage_margin": -1.1102230246251565e-16,
+    "maximum_absolute_roll_deg": 2.5444437451708134e-14,
+    "fov_floor_violation_frames": 0,
+    "coverage_violation_frames": 0
+  }
+}

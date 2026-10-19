@@ -6,7 +6,8 @@ from scipy.spatial.transform import Rotation
 
 from .math3d import (unit_quaternions, from_rotvec, rotvec, multiply, conjugate,
                      angular_distance, matrices, slerp)
-from .geometry import PinholeCamera, geometric_fov, coverage_margin, project_to_fov
+from .geometry import (PinholeCamera, geometric_fov, coverage_margin, project_to_fov,
+                       project_horizon_to_fov)
 from .gyroflow_global import SmoothingConfig, gyroflow_smooth, stabilize_global, horizon_gain
 from .sliding_window import WindowConfig, SlidingWindowStabilizer, stabilize_window
 from .synthetic import make_motion
@@ -237,8 +238,9 @@ def test_horizon_stationary_tilt_and_feedback(feedback, length):
     saved = raw.copy()
     config = SmoothingConfig(enablehorizon=True)
     actual, _ = gyroflow_smooth(raw, config, feedback=feedback)
-    expected_roll = {None: 0., 1.0: 0., 0.5: 4., 0.25: 7.2, 0.0: 12.}[feedback]
-    assert np.allclose(horizon_error_deg(actual), expected_roll, atol=1e-10)
+    # A crop-feedback scalar controls smoothing, not an arbitrary fraction of
+    # the level target. The outer geometry solver limits infeasible leveling.
+    assert np.allclose(horizon_error_deg(actual), 0., atol=1e-10)
     assert np.array_equal(raw, saved)
 
 
@@ -248,34 +250,96 @@ def test_horizon_per_frame_feedback_and_preserved_view():
     base, base_info = gyroflow_smooth(raw, SmoothingConfig(), feedback=feedback)
     result, info = gyroflow_smooth(raw, SmoothingConfig(enablehorizon=True), feedback=feedback)
     assert np.allclose(matrices(result)[:, :, 2], matrices(base)[:, :, 2], atol=1e-12)
-    before, after = horizon_error_deg(base), horizon_error_deg(result)
-    # Check observable roll against the specified feedback mapping.
-    assert np.allclose(after, before * (1-feedback)/(1+feedback), atol=1e-10)
+    assert np.allclose(horizon_error_deg(result), 0., atol=1e-10)
     assert np.allclose(np.linalg.norm(result, axis=1), 1, atol=1e-12)
     assert np.array_equal(info['first_distance'], base_info['first_distance'])
+    weaker, _ = gyroflow_smooth(raw, SmoothingConfig(enablehorizon=True), feedback=1.0)
+    assert np.max(np.abs(matrices(weaker)[:, :, 2] - matrices(result)[:, :, 2])) > 1e-3
+    # The legacy conversion helper remains compatible, but does not set roll.
     assert np.all(horizon_gain(feedback) >= feedback)
     assert np.all(np.diff(horizon_gain(feedback)) >= 0)
     assert np.allclose(horizon_gain([-1., 2.]), [0., 1.])
     with pytest.raises(ValueError, match='finite'):
         horizon_gain([np.nan])
+    for invalid in [np.nan, np.inf]:
+        with pytest.raises(ValueError, match='finite'):
+            gyroflow_smooth(raw, SmoothingConfig(enablehorizon=True), feedback=invalid)
 
 
 def test_horizon_zoom_feedback_sees_corrected_poses():
     raw = np.tile(from_rotvec(np.array([0., 0., np.deg2rad(15.)])), (60, 1))
     config = SmoothingConfig(minimum_fov=0.9, enablehorizon=True)
-    first = stabilize_global(raw, replace(config, max_iterations=0))
+    candidate, _ = gyroflow_smooth(raw, config)
+    assert geometric_fov(raw, candidate, PinholeCamera()).min() < config.minimum_fov
     final = stabilize_global(raw, config)
-    assert first.fov.min() < config.minimum_fov
     assert final.iterations > 0
     assert np.all(final.diagnostics['feedback'] < 1)
-    assert final.fov.min() > first.fov.min()
+    assert final.fov.min() >= config.minimum_fov-1e-9
+    assert coverage_margin(raw, final.orientations, final.fov, PinholeCamera()).min() >= -1e-8
     assert np.max(np.abs(horizon_error_deg(final.orientations))) > 0.1
-    # Global retains its finite soft feedback contract. The window adds hard FOV.
+    # Both horizon pipelines retain feedback and enforce the coverage floor.
     windowed = stabilize_window(raw, config)
     assert windowed.fov.min() >= config.minimum_fov-1e-9
     assert coverage_margin(raw, windowed.orientations, windowed.fov, PinholeCamera()).min() >= -1e-8
     full_frame = stabilize_window(raw, replace(config, minimum_fov=1.0))
     assert np.max(angular_distance(full_frame.orientations, raw)) < 1e-10
+
+
+def test_horizon_projection_keeps_level_while_repairing_view():
+    # Keeping the initial view is a known feasible, level solution at FOV=.6.
+    # The target pans too far. Whole-pose SLERP incorrectly restores raw roll.
+    raw_rotation = Rotation.from_euler('YXZ', [[0., 0., 12.], [5., 3., -10.]], degrees=True)
+    target_rotation = Rotation.from_euler('YXZ', [[30., 10., 0.], [35., 12., 0.]], degrees=True)
+    raw = raw_rotation.as_quat()[:, [3, 0, 1, 2]]
+    target = target_rotation.as_quat()[:, [3, 0, 1, 2]]
+    saved = target.copy()
+    camera = PinholeCamera()
+    ordinary, _ = project_to_fov(raw, target, 0.6, camera)
+    actual, projected = project_horizon_to_fov(raw, target, 0.6, camera, (0., 1., 0.))
+    assert projected.all()
+    assert np.max(np.abs(horizon_error_deg(ordinary))) > 1.0
+    assert np.max(np.abs(horizon_error_deg(actual))) < 1e-8
+    assert geometric_fov(raw, actual, camera).min() >= 0.6-1e-9
+    assert coverage_margin(raw, actual, np.full(len(raw), 0.6), camera).min() >= -1e-8
+    assert np.array_equal(target, saved)
+    # Some requested pan is retained, rather than returning only the raw view.
+    angles = Rotation.from_quat(actual[:, [1, 2, 3, 0]]).as_euler('YXZ', degrees=True)
+    assert np.all(angles[:, 0] > [1., 6.])
+
+
+@pytest.mark.parametrize('floor', [0.6, 0.9, 1.0])
+@pytest.mark.parametrize('diagonal', [60., 100., 140.])
+def test_horizon_projection_independent_coverage(floor, diagonal):
+    rng = np.random.default_rng(730)
+    raw = unit_quaternions(rng.normal(size=(40, 4)))
+    target = multiply(raw, from_rotvec(rng.normal(size=(40, 3)) * 0.3))
+    up = np.array([0.2, 0.8, -0.3])
+    up /= np.linalg.norm(up)
+    camera = PinholeCamera(diagonal)
+    actual, _ = project_horizon_to_fov(raw, target, floor, camera, up)
+    assert np.isfinite(actual).all()
+    assert np.allclose(np.linalg.norm(actual, axis=1), 1., atol=1e-12)
+    assert geometric_fov(raw, actual, camera).min() >= floor-1e-9
+    assert coverage_margin(raw, actual, np.full(len(raw), floor), camera).min() >= -1e-8
+    if floor == 1.0:
+        assert np.array_equal(actual, raw)
+
+
+def test_horizon_end_to_end_feedback_level_and_coverage():
+    raw = make_motion('impulse', 11, seconds=4).raw
+    config = SmoothingConfig(enablehorizon=True, minimum_fov=0.6)
+    result = stabilize_window(raw, config)
+    assert result.iterations > 0
+    assert min(d['feedback_min'] for d in result.diagnostics['windows']) < 1.0
+    # Check the committed output, after seam correction and the final projection.
+    assert np.max(np.abs(horizon_error_deg(result.orientations))) < 1e-8
+    assert result.fov.min() >= 0.6-1e-9
+    assert coverage_margin(raw, result.orientations, result.fov, PinholeCamera()).min() >= -1e-8
+    def view_angles(q):
+        return Rotation.from_quat(q[:, [1, 2, 3, 0]]).as_euler('YXZ', degrees=True)[:, :2]
+    original_curvature = np.mean(np.diff(view_angles(raw), n=2, axis=0)**2, axis=0)
+    output_curvature = np.mean(np.diff(view_angles(result.orientations), n=2, axis=0)**2, axis=0)
+    assert np.all(output_curvature < original_curvature)
 
 
 @pytest.mark.parametrize('feedback', [0.25, 1.0])

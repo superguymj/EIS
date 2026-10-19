@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
     parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
-                        help="Prefer a level horizon using the existing FOV feedback")
+                        help="Level the horizon with FOV feedback and a coverage-preserving projection")
     parser.add_argument("--horizon-up", type=float, nargs=3, default=(0.0, 1.0, 0.0),
                         metavar=("X", "Y", "Z"),
                         help="World vertical that should align with camera +Y (default: 0 1 0)")
@@ -72,7 +72,7 @@ def build(output):
     pieces.append(CLI)
     target = Path(output)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text('\n'.join(pieces), encoding='utf-8')
+    target.write_text('\n'.join(pieces), encoding='utf-8', newline='\n')
     for notice in ['LICENSE', 'NOTICE.md']:
         shutil.copy2(root/notice, target.parent/notice)
     print(target)

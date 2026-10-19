@@ -15,7 +15,8 @@ from scipy.linalg import cholesky_banded, cho_solve_banded
 
 from .math3d import (unit_quaternions, conjugate, multiply, rotvec, from_rotvec,
                      angular_distance, world_velocity)
-from .geometry import PinholeCamera, geometric_fov, project_to_fov
+from .geometry import (PinholeCamera, geometric_fov, project_to_fov,
+                       horizon_reference, level_horizon, project_horizon_to_fov)
 from .gyroflow_global import SmoothingConfig, StabilizationResult, gyroflow_smooth, zoom_curve
 
 
@@ -220,6 +221,12 @@ class SlidingWindowStabilizer:
                 extended, config, self.camera.diagonal_fov_deg, extended_feedback,
                 distance_scale=distance_scale, normalization_end=len(raw))
             pending = fit_fixed_history(candidate[history_count:len(raw)], self._history, boundary_weight)
+            if config.enablehorizon:
+                # A seam fit can introduce roll. Restore the observable level
+                # target before FOV feedback; do not compound pole/turn tapers.
+                _, reliability = horizon_reference(pending, config.horizon_up)
+                regular = reliability >= 1 - 1e-12
+                pending[regular] = level_horizon(pending[regular], config.horizon_up)
             all_poses = np.concatenate([self._history, pending])
             geometry = geometric_fov(raw, all_poses, self.camera)
             zoom = zoom_curve(geometry, config)
@@ -232,7 +239,11 @@ class SlidingWindowStabilizer:
 
         projected = np.zeros(len(pending), dtype=bool)
         if window.hard_fov:
-            pending, projected = project_to_fov(pending_raw, pending, config.minimum_fov, self.camera)
+            if config.enablehorizon:
+                pending, projected = project_horizon_to_fov(
+                    pending_raw, pending, config.minimum_fov, self.camera, config.horizon_up)
+            else:
+                pending, projected = project_to_fov(pending_raw, pending, config.minimum_fov, self.camera)
         all_poses = np.concatenate([self._history, pending])
         geometry = geometric_fov(raw, all_poses, self.camera)
         zoom = zoom_curve(geometry, config)[history_count:]
@@ -258,10 +269,17 @@ class SlidingWindowStabilizer:
             'actual_lookahead_last': len(pending_raw)-commit_count,
             'iterations': iterations,
             'projected_frames': int(np.sum(projected[:commit_count])),
+            'feedback_min': float(np.min(feedback[history_count:history_count+commit_count])),
+            'feedback_mean': float(np.mean(feedback[history_count:history_count+commit_count])),
             'distance_scale_deg': float(np.rad2deg(self._distance_scale)),
             'milliseconds': (perf_counter()-started)*1000,
             'eof': eof,
         }
+        if config.enablehorizon:
+            angle, reliability = horizon_reference(committed_poses, config.horizon_up)
+            observable = reliability >= 1 - 1e-12
+            diagnostic['horizon_limited_frames'] = int(np.sum(observable & (np.abs(angle) > 1e-8)))
+            diagnostic['horizon_max_error_deg'] = float(np.rad2deg(np.max(np.abs(angle[observable]), initial=0)))
         batch = FrameBatch(self._committed, committed_poses, committed_fov,
                            final_geometry[:commit_count].copy(), diagnostic)
         self._history = np.concatenate([self._history, committed_poses])[-window.history:]

@@ -1,0 +1,11 @@
+11:07:18 [DEBUG] (1) gyroflow: [in main] Qt version: 6.7.3
+11:07:18 [DEBUG] (1) gyroflow: Gyroflow 1.6.3
+11:07:18 [INFO] Videos: ["C:\\Users\\15474\\Desktop\\ddl\\projects\\EIS\\dataset\\insta360\\20260826_195214\\PRO_VID_20260826_195214_00_052.mp4"]
+11:07:18 [INFO] Settings file path: C:\Users\15474\AppData\Local\Gyroflow\settings.json
+11:07:18 [INFO] Lens profiles directory: "\\\\?\\C:\\Users\\15474\\Desktop\\ddl\\projects\\EIS\\dataset\\tools\\gyroflow\\camera_presets"
+11:07:18 [INFO] Loaded 12344 lens profiles in 215.769ms
+11:07:18 [WARN] IMU duration 7798.233730324075 is different than video duration (7340.666666666667)
+11:07:18 [INFO] [3ad5d470] Processing done
+11:07:18 [INFO] Done in 0.382s
+0.34.0 (git 79ef5c4) - Multimedia Development Kit. Copyright (c) 2016-2025 WangBin(QtAV author) <wbsecg1 at gmail.com>
+Build for: Windows0x0600/10.0.26200 x86_64; vcruntime14.35.32215/14.44.35211 msvcp140.dll; Clang22.0.0 (++20250812082130+296e057d0bf2-1~exp1~20250812082146.1091); 05:58:25 Sep  2 2025. 

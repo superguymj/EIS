@@ -15,9 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 from .math3d import (unit_quaternions, angular_distance, scalar_forward_backward,
-                     quaternion_forward_backward, envelope, matrices, multiply,
-                     from_rotvec)
-from .geometry import PinholeCamera, geometric_fov
+                     quaternion_forward_backward, envelope)
+from .geometry import (PinholeCamera, geometric_fov, level_horizon,
+                       project_horizon_to_fov)
 
 
 @dataclass(frozen=True)
@@ -55,10 +55,11 @@ class SmoothingConfig:
 
 
 def horizon_gain(feedback):
-    """Map the existing finite feedback to a bounded, soft horizon preference.
+    """Legacy soft-gain conversion, retained for callers of the old helper.
 
     h(c)=2c/(1+c) retains more correction than c inside (0,1), while still
-    releasing it at zero. No separate horizon feedback state is maintained.
+    releasing it at zero. The current solver uses geometric feasibility rather
+    than this gain to limit leveling; FOV feedback still controls smoothing.
     """
     feedback = np.asarray(feedback, dtype=np.float64)
     if not np.isfinite(feedback).all():
@@ -67,7 +68,7 @@ def horizon_gain(feedback):
     return 2.0 * c / (1.0 + c)
 
 
-def _apply_horizon(poses, config, feedback):
+def _apply_horizon(poses, config):
     """Correct image roll about local +Z, preserving the optical axis.
 
     Camera +Y should agree with the supplied world vertical. Taper the correction
@@ -76,23 +77,7 @@ def _apply_horizon(poses, config, feedback):
     """
     if not config.enablehorizon or len(poses) == 0:
         return poses
-    gain = horizon_gain(feedback)
-    vertical = np.einsum('nji,j->ni', matrices(poses), config.horizon_up)
-    visibility = np.hypot(vertical[:, 0], vertical[:, 1])
-    angle = np.arctan2(-vertical[:, 0], vertical[:, 1])
-
-    # Suppress ill-defined leveling within 5 degrees of a pole; fully enable it
-    # beyond 10 degrees. Smoothstep avoids a hard on/off threshold in the pose.
-    pole = np.clip((visibility - np.sin(np.deg2rad(5.0))) /
-                   (np.sin(np.deg2rad(10.0)) - np.sin(np.deg2rad(5.0))), 0.0, 1.0)
-    pole = pole * pole * (3.0 - 2.0 * pole)
-    # Partial shortest-arc correction has a branch cut at +/-180 degrees.
-    # Fade between 150 and 180 degrees, so crossing the cut stays continuous.
-    turn = np.clip((np.pi - np.abs(angle)) / np.deg2rad(30.0), 0.0, 1.0)
-    turn = turn * turn * (3.0 - 2.0 * turn)
-    correction = np.zeros((len(poses), 3))
-    correction[:, 2] = angle * gain * pole * turn
-    return multiply(poses, from_rotvec(correction))
+    return level_horizon(poses, config.horizon_up)
 
 
 @dataclass
@@ -110,8 +95,8 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     Returns (poses, diagnostics). Scalar/vector feedback corresponds to
     smoothing_fov_limit_per_frame, sampled here at the same fixed video FPS.
     duration_ms=N/fps*1000 reproduces the source's N/duration sample rate.
-    Optional horizon correction shares this feedback and runs on every nonempty
-    return path, before the caller evaluates geometry and updates feedback.
+    FOV feedback controls the two smoothing passes. Optional horizon correction
+    sets a level target; the caller checks geometry and limits it if necessary.
     """
     q = np.ascontiguousarray(q, dtype=np.float64)
     if len(q) == 0:
@@ -123,6 +108,8 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
         velocity[1:] = np.rad2deg(angular_distance(q[:-1], q[1:])) * config.fps
     velocity = scalar_forward_backward(velocity, a_f)
     scalers = np.ones(len(q)) if feedback is None else np.broadcast_to(feedback, (len(q),))
+    if config.enablehorizon and not np.isfinite(scalers).all():
+        raise ValueError('horizon feedback must be finite')
     max_velocity = 500 * config.smoothness * (diagonal_fov_deg / 120.0) * scalers * 0.5
     ratio = velocity / np.maximum(max_velocity, 1e-15)
     alpha = np.minimum(1.0, a_s + (a_f-a_s) * ratio)
@@ -134,7 +121,7 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         if maximum == 0.0:
             # Rust 0/0 -> NaN; f64::min(NaN, 1) -> 1, so pass two is identity.
-            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config), {'distance_max': maximum, 'first_distance': first_distance}
         distance = distance / maximum
     else:
         distance = np.clip(distance / max(float(distance_scale), 1e-8), 0, 1)
@@ -143,12 +130,12 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         normalizer = float(np.max(distance[:norm_end]))
         if normalizer == 0.0:
-            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config), {'distance_max': maximum, 'first_distance': first_distance}
         distance /= normalizer
     distance = (distance + 1) / 2
     alpha_second = np.minimum(1.0, a_s + (a_f-a_s) * ratio * distance)
     second = quaternion_forward_backward(first, alpha_second)
-    return _apply_horizon(second, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+    return _apply_horizon(second, config), {'distance_max': maximum, 'first_distance': first_distance}
 
 
 def zoom_curve(geometric, config):
@@ -180,5 +167,11 @@ def stabilize_global(orientations, config=None, camera=None):
         geometric = geometric_fov(q, smooth, camera)
         fov = zoom_curve(geometric, config)
         iterations += 1
+    if config.enablehorizon:
+        smooth, projected = project_horizon_to_fov(q, smooth, config.minimum_fov,
+                                                  camera, config.horizon_up)
+        geometric = geometric_fov(q, smooth, camera)
+        fov = zoom_curve(geometric, config)
+        info = dict(info, projected_frames=int(np.sum(projected)))
     info = dict(info, feedback=feedback)
     return StabilizationResult(smooth, fov, geometric, iterations, info)

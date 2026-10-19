@@ -153,7 +153,7 @@ def envelope(values, coefficient):
     return result
 
 
-# Source: geometry.py; SHA256: 9891ee3c3cb011d5c5ecf15b7657a984a5b2deedef640b457a145eb038e42878
+# Source: geometry.py; SHA256: 5340bd2e83fbace77889807da2d5284841f4a1e36b88fd0acad23a96ef8be92c
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Exact centered-rectangle coverage for an undistorted pinhole camera.
@@ -251,7 +251,88 @@ def project_to_fov(raw, smooth, minimum_fov, camera, iterations=30):
     return result, bad
 
 
-# Source: gyroflow_global.py; SHA256: 5b9ce8232853df6c78232deca29f9d5ba46269242dcb877f2a57b0cec4f5f403
+def horizon_reference(poses, up):
+    """Local +Z leveling angle and reliability relative to a world vertical."""
+    vertical = np.einsum('nji,j->ni', matrices(poses), up)
+    visibility = np.hypot(vertical[:, 0], vertical[:, 1])
+    angle = np.arctan2(-vertical[:, 0], vertical[:, 1])
+    pole = np.clip((visibility - np.sin(np.deg2rad(5.0))) /
+                   (np.sin(np.deg2rad(10.0)) - np.sin(np.deg2rad(5.0))), 0.0, 1.0)
+    turn = np.clip((np.pi - np.abs(angle)) / np.deg2rad(30.0), 0.0, 1.0)
+    reliability = pole * pole * (3 - 2 * pole) * turn * turn * (3 - 2 * turn)
+    return angle, reliability
+
+
+def level_horizon(poses, up):
+    """Level about the optical axis; fade only at geometric degeneracies."""
+    angle, reliability = horizon_reference(poses, up)
+    correction = np.zeros((len(poses), 3))
+    correction[:, 2] = angle * reliability
+    return multiply(poses, from_rotvec(correction))
+
+
+def project_horizon_to_fov(raw, candidate, minimum_fov, camera, up, iterations=30):
+    """Keep leveling while repairing view motion within the exact crop bound.
+
+    The regular path connects a feasible anchor to the leveled target, re-levels
+    the interpolated view, and interpolates residual roll separately. A failed
+    full-pose projection therefore need not undo roll and view motion together.
+    Near poles/half turns, use the ordinary verified projection instead.
+    """
+    result, projected = project_to_fov(raw, candidate, minimum_fov, camera, iterations)
+    if len(raw) == 0 or minimum_fov >= 1 - 1e-12:
+        return result, projected
+    _, raw_reliability = horizon_reference(raw, up)
+    _, candidate_reliability = horizon_reference(candidate, up)
+    regular = (raw_reliability >= 1 - 1e-12) & (candidate_reliability >= 1 - 1e-12)
+    if not regular.any():
+        return result, projected
+
+    indices = np.flatnonzero(regular)
+    q = raw[indices]
+    target = level_horizon(candidate[indices], up)
+    crop_bound = min(1.0, minimum_fov + 2e-8)
+    full_level_fits = geometric_fov(q, target, camera) >= crop_bound
+    result[indices[full_level_fits]] = target[full_level_fits]
+    pending = ~full_level_fits
+    if pending.any():
+        selected = indices[pending]
+        q, target = raw[selected], target[pending]
+        level_raw = level_horizon(q, up)
+        roll_anchor, _ = project_to_fov(q, level_raw, minimum_fov, camera, iterations)
+        # Both anchors are feasible. Start from whichever is closer to level;
+        # this also keeps a useful full-pose solution if view motion helps roll.
+        fallback = result[selected]
+        anchor_angle, _ = horizon_reference(roll_anchor, up)
+        fallback_angle, _ = horizon_reference(fallback, up)
+        use_fallback = np.abs(fallback_angle) < np.abs(anchor_angle) - 1e-12
+        anchor = np.where(use_fallback[:, None], fallback, roll_anchor)
+        anchor_angle, _ = horizon_reference(anchor, up)
+        level_anchor = level_horizon(anchor, up)
+        low, high = np.zeros(len(q)), np.ones(len(q))
+        accepted = anchor.copy()
+        for _ in range(iterations):
+            fraction = (low + high) / 2
+            view = slerp(level_anchor, target, fraction)
+            _, reliability = horizon_reference(view, up)
+            view = level_horizon(view, up)
+            residual = np.zeros((len(q), 3))
+            residual[:, 2] = -anchor_angle * (1 - fraction)
+            trial = multiply(view, from_rotvec(residual))
+            feasible = ((geometric_fov(q, trial, camera) >= crop_bound) &
+                        (reliability >= 1 - 1e-12))
+            accepted[feasible] = trial[feasible]
+            low = np.where(feasible, fraction, low)
+            high = np.where(feasible, high, fraction)
+        result[selected] = accepted
+
+    # Keep the original safety guarantee even on a nonmonotone/degenerate path.
+    unsafe = geometric_fov(raw, result, camera) < minimum_fov - 1e-10
+    result[unsafe] = raw[unsafe]
+    return result, projected
+
+
+# Source: gyroflow_global.py; SHA256: 117b17dfc0f032382c87209e3e963ec4defee7cdb8b127e02bf05ed6c37c33ba
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Default algorithm derived from Gyroflow, Copyright 2021-2022 Aphobius.
@@ -305,10 +386,11 @@ class SmoothingConfig:
 
 
 def horizon_gain(feedback):
-    """Map the existing finite feedback to a bounded, soft horizon preference.
+    """Legacy soft-gain conversion, retained for callers of the old helper.
 
     h(c)=2c/(1+c) retains more correction than c inside (0,1), while still
-    releasing it at zero. No separate horizon feedback state is maintained.
+    releasing it at zero. The current solver uses geometric feasibility rather
+    than this gain to limit leveling; FOV feedback still controls smoothing.
     """
     feedback = np.asarray(feedback, dtype=np.float64)
     if not np.isfinite(feedback).all():
@@ -317,7 +399,7 @@ def horizon_gain(feedback):
     return 2.0 * c / (1.0 + c)
 
 
-def _apply_horizon(poses, config, feedback):
+def _apply_horizon(poses, config):
     """Correct image roll about local +Z, preserving the optical axis.
 
     Camera +Y should agree with the supplied world vertical. Taper the correction
@@ -326,23 +408,7 @@ def _apply_horizon(poses, config, feedback):
     """
     if not config.enablehorizon or len(poses) == 0:
         return poses
-    gain = horizon_gain(feedback)
-    vertical = np.einsum('nji,j->ni', matrices(poses), config.horizon_up)
-    visibility = np.hypot(vertical[:, 0], vertical[:, 1])
-    angle = np.arctan2(-vertical[:, 0], vertical[:, 1])
-
-    # Suppress ill-defined leveling within 5 degrees of a pole; fully enable it
-    # beyond 10 degrees. Smoothstep avoids a hard on/off threshold in the pose.
-    pole = np.clip((visibility - np.sin(np.deg2rad(5.0))) /
-                   (np.sin(np.deg2rad(10.0)) - np.sin(np.deg2rad(5.0))), 0.0, 1.0)
-    pole = pole * pole * (3.0 - 2.0 * pole)
-    # Partial shortest-arc correction has a branch cut at +/-180 degrees.
-    # Fade between 150 and 180 degrees, so crossing the cut stays continuous.
-    turn = np.clip((np.pi - np.abs(angle)) / np.deg2rad(30.0), 0.0, 1.0)
-    turn = turn * turn * (3.0 - 2.0 * turn)
-    correction = np.zeros((len(poses), 3))
-    correction[:, 2] = angle * gain * pole * turn
-    return multiply(poses, from_rotvec(correction))
+    return level_horizon(poses, config.horizon_up)
 
 
 @dataclass
@@ -360,8 +426,8 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     Returns (poses, diagnostics). Scalar/vector feedback corresponds to
     smoothing_fov_limit_per_frame, sampled here at the same fixed video FPS.
     duration_ms=N/fps*1000 reproduces the source's N/duration sample rate.
-    Optional horizon correction shares this feedback and runs on every nonempty
-    return path, before the caller evaluates geometry and updates feedback.
+    FOV feedback controls the two smoothing passes. Optional horizon correction
+    sets a level target; the caller checks geometry and limits it if necessary.
     """
     q = np.ascontiguousarray(q, dtype=np.float64)
     if len(q) == 0:
@@ -373,6 +439,8 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
         velocity[1:] = np.rad2deg(angular_distance(q[:-1], q[1:])) * config.fps
     velocity = scalar_forward_backward(velocity, a_f)
     scalers = np.ones(len(q)) if feedback is None else np.broadcast_to(feedback, (len(q),))
+    if config.enablehorizon and not np.isfinite(scalers).all():
+        raise ValueError('horizon feedback must be finite')
     max_velocity = 500 * config.smoothness * (diagonal_fov_deg / 120.0) * scalers * 0.5
     ratio = velocity / np.maximum(max_velocity, 1e-15)
     alpha = np.minimum(1.0, a_s + (a_f-a_s) * ratio)
@@ -384,7 +452,7 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         if maximum == 0.0:
             # Rust 0/0 -> NaN; f64::min(NaN, 1) -> 1, so pass two is identity.
-            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config), {'distance_max': maximum, 'first_distance': first_distance}
         distance = distance / maximum
     else:
         distance = np.clip(distance / max(float(distance_scale), 1e-8), 0, 1)
@@ -393,12 +461,12 @@ def gyroflow_smooth(q, config, diagonal_fov_deg=120.0, feedback=None, distance_s
     if distance_scale is None:
         normalizer = float(np.max(distance[:norm_end]))
         if normalizer == 0.0:
-            return _apply_horizon(first, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+            return _apply_horizon(first, config), {'distance_max': maximum, 'first_distance': first_distance}
         distance /= normalizer
     distance = (distance + 1) / 2
     alpha_second = np.minimum(1.0, a_s + (a_f-a_s) * ratio * distance)
     second = quaternion_forward_backward(first, alpha_second)
-    return _apply_horizon(second, config, scalers), {'distance_max': maximum, 'first_distance': first_distance}
+    return _apply_horizon(second, config), {'distance_max': maximum, 'first_distance': first_distance}
 
 
 def zoom_curve(geometric, config):
@@ -430,11 +498,17 @@ def stabilize_global(orientations, config=None, camera=None):
         geometric = geometric_fov(q, smooth, camera)
         fov = zoom_curve(geometric, config)
         iterations += 1
+    if config.enablehorizon:
+        smooth, projected = project_horizon_to_fov(q, smooth, config.minimum_fov,
+                                                  camera, config.horizon_up)
+        geometric = geometric_fov(q, smooth, camera)
+        fov = zoom_curve(geometric, config)
+        info = dict(info, projected_frames=int(np.sum(projected)))
     info = dict(info, feedback=feedback)
     return StabilizationResult(smooth, fov, geometric, iterations, info)
 
 
-# Source: sliding_window.py; SHA256: 84aeb99f2fe27f60a94ff084c6f8003109dc3e5eaa8661ea24ad48e8ec8cb3c3
+# Source: sliding_window.py; SHA256: 037facb7f6d51036386c807d06b94ce54f13ed34a803a0a8a49ac6871604ec92
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded-lookahead quaternion stabilization with immutable committed history.
@@ -653,6 +727,12 @@ class SlidingWindowStabilizer:
                 extended, config, self.camera.diagonal_fov_deg, extended_feedback,
                 distance_scale=distance_scale, normalization_end=len(raw))
             pending = fit_fixed_history(candidate[history_count:len(raw)], self._history, boundary_weight)
+            if config.enablehorizon:
+                # A seam fit can introduce roll. Restore the observable level
+                # target before FOV feedback; do not compound pole/turn tapers.
+                _, reliability = horizon_reference(pending, config.horizon_up)
+                regular = reliability >= 1 - 1e-12
+                pending[regular] = level_horizon(pending[regular], config.horizon_up)
             all_poses = np.concatenate([self._history, pending])
             geometry = geometric_fov(raw, all_poses, self.camera)
             zoom = zoom_curve(geometry, config)
@@ -665,7 +745,11 @@ class SlidingWindowStabilizer:
 
         projected = np.zeros(len(pending), dtype=bool)
         if window.hard_fov:
-            pending, projected = project_to_fov(pending_raw, pending, config.minimum_fov, self.camera)
+            if config.enablehorizon:
+                pending, projected = project_horizon_to_fov(
+                    pending_raw, pending, config.minimum_fov, self.camera, config.horizon_up)
+            else:
+                pending, projected = project_to_fov(pending_raw, pending, config.minimum_fov, self.camera)
         all_poses = np.concatenate([self._history, pending])
         geometry = geometric_fov(raw, all_poses, self.camera)
         zoom = zoom_curve(geometry, config)[history_count:]
@@ -691,10 +775,17 @@ class SlidingWindowStabilizer:
             'actual_lookahead_last': len(pending_raw)-commit_count,
             'iterations': iterations,
             'projected_frames': int(np.sum(projected[:commit_count])),
+            'feedback_min': float(np.min(feedback[history_count:history_count+commit_count])),
+            'feedback_mean': float(np.mean(feedback[history_count:history_count+commit_count])),
             'distance_scale_deg': float(np.rad2deg(self._distance_scale)),
             'milliseconds': (perf_counter()-started)*1000,
             'eof': eof,
         }
+        if config.enablehorizon:
+            angle, reliability = horizon_reference(committed_poses, config.horizon_up)
+            observable = reliability >= 1 - 1e-12
+            diagnostic['horizon_limited_frames'] = int(np.sum(observable & (np.abs(angle) > 1e-8)))
+            diagnostic['horizon_max_error_deg'] = float(np.rad2deg(np.max(np.abs(angle[observable]), initial=0)))
         batch = FrameBatch(self._committed, committed_poses, committed_fov,
                            final_geometry[:commit_count].copy(), diagnostic)
         self._history = np.concatenate([self._history, committed_poses])[-window.history:]
@@ -746,7 +837,7 @@ def main():
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
     parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
-                        help="Prefer a level horizon using the existing FOV feedback")
+                        help="Level the horizon with FOV feedback and a coverage-preserving projection")
     parser.add_argument("--horizon-up", type=float, nargs=3, default=(0.0, 1.0, 0.0),
                         metavar=("X", "Y", "Z"),
                         help="World vertical that should align with camera +Y (default: 0 1 0)")

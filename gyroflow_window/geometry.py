@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
-from .math3d import conjugate, multiply, matrices, slerp
+from .math3d import conjugate, multiply, matrices, slerp, from_rotvec
 
 
 @dataclass(frozen=True)
@@ -94,3 +94,84 @@ def project_to_fov(raw, smooth, minimum_fov, camera, iterations=30):
     still_bad = geometric_fov(raw, result, camera) < minimum_fov - 1e-10
     result[still_bad] = raw[still_bad]
     return result, bad
+
+
+def horizon_reference(poses, up):
+    """Local +Z leveling angle and reliability relative to a world vertical."""
+    vertical = np.einsum('nji,j->ni', matrices(poses), up)
+    visibility = np.hypot(vertical[:, 0], vertical[:, 1])
+    angle = np.arctan2(-vertical[:, 0], vertical[:, 1])
+    pole = np.clip((visibility - np.sin(np.deg2rad(5.0))) /
+                   (np.sin(np.deg2rad(10.0)) - np.sin(np.deg2rad(5.0))), 0.0, 1.0)
+    turn = np.clip((np.pi - np.abs(angle)) / np.deg2rad(30.0), 0.0, 1.0)
+    reliability = pole * pole * (3 - 2 * pole) * turn * turn * (3 - 2 * turn)
+    return angle, reliability
+
+
+def level_horizon(poses, up):
+    """Level about the optical axis; fade only at geometric degeneracies."""
+    angle, reliability = horizon_reference(poses, up)
+    correction = np.zeros((len(poses), 3))
+    correction[:, 2] = angle * reliability
+    return multiply(poses, from_rotvec(correction))
+
+
+def project_horizon_to_fov(raw, candidate, minimum_fov, camera, up, iterations=30):
+    """Keep leveling while repairing view motion within the exact crop bound.
+
+    The regular path connects a feasible anchor to the leveled target, re-levels
+    the interpolated view, and interpolates residual roll separately. A failed
+    full-pose projection therefore need not undo roll and view motion together.
+    Near poles/half turns, use the ordinary verified projection instead.
+    """
+    result, projected = project_to_fov(raw, candidate, minimum_fov, camera, iterations)
+    if len(raw) == 0 or minimum_fov >= 1 - 1e-12:
+        return result, projected
+    _, raw_reliability = horizon_reference(raw, up)
+    _, candidate_reliability = horizon_reference(candidate, up)
+    regular = (raw_reliability >= 1 - 1e-12) & (candidate_reliability >= 1 - 1e-12)
+    if not regular.any():
+        return result, projected
+
+    indices = np.flatnonzero(regular)
+    q = raw[indices]
+    target = level_horizon(candidate[indices], up)
+    crop_bound = min(1.0, minimum_fov + 2e-8)
+    full_level_fits = geometric_fov(q, target, camera) >= crop_bound
+    result[indices[full_level_fits]] = target[full_level_fits]
+    pending = ~full_level_fits
+    if pending.any():
+        selected = indices[pending]
+        q, target = raw[selected], target[pending]
+        level_raw = level_horizon(q, up)
+        roll_anchor, _ = project_to_fov(q, level_raw, minimum_fov, camera, iterations)
+        # Both anchors are feasible. Start from whichever is closer to level;
+        # this also keeps a useful full-pose solution if view motion helps roll.
+        fallback = result[selected]
+        anchor_angle, _ = horizon_reference(roll_anchor, up)
+        fallback_angle, _ = horizon_reference(fallback, up)
+        use_fallback = np.abs(fallback_angle) < np.abs(anchor_angle) - 1e-12
+        anchor = np.where(use_fallback[:, None], fallback, roll_anchor)
+        anchor_angle, _ = horizon_reference(anchor, up)
+        level_anchor = level_horizon(anchor, up)
+        low, high = np.zeros(len(q)), np.ones(len(q))
+        accepted = anchor.copy()
+        for _ in range(iterations):
+            fraction = (low + high) / 2
+            view = slerp(level_anchor, target, fraction)
+            _, reliability = horizon_reference(view, up)
+            view = level_horizon(view, up)
+            residual = np.zeros((len(q), 3))
+            residual[:, 2] = -anchor_angle * (1 - fraction)
+            trial = multiply(view, from_rotvec(residual))
+            feasible = ((geometric_fov(q, trial, camera) >= crop_bound) &
+                        (reliability >= 1 - 1e-12))
+            accepted[feasible] = trial[feasible]
+            low = np.where(feasible, fraction, low)
+            high = np.where(feasible, high, fraction)
+        result[selected] = accepted
+
+    # Keep the original safety guarantee even on a nonmonotone/degenerate path.
+    unsafe = geometric_fov(raw, result, camera) < minimum_fov - 1e-10
+    result[unsafe] = raw[unsafe]
+    return result, projected

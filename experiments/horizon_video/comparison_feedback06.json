@@ -1,0 +1,114 @@
+{
+  "reference_commit": "288a63a",
+  "minimum_fov": 0.6,
+  "videos": {
+    "046": {
+      "video": "dataset/insta360/20260826_112713/PRO_VID_20260826_112713_00_046.mp4",
+      "frame_count": 732,
+      "horizon_off_bitwise_compatible": true,
+      "results": {
+        "raw": {
+          "roll_rms_deg": 4.746324956326363,
+          "maximum_absolute_roll_deg": 8.841128731737765,
+          "pitch_yaw_second_difference_rms_deg": [
+            0.3706676537754296,
+            0.3215409919338257
+          ]
+        },
+        "horizon_off": {
+          "roll_rms_deg": 4.654870093775976,
+          "maximum_absolute_roll_deg": 6.740983660744289,
+          "pitch_yaw_second_difference_rms_deg": [
+            0.09439420739771767,
+            0.24752244979404128
+          ],
+          "minimum_fov": 0.688792010681761,
+          "iterations": 0,
+          "projected_frames": 0,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        },
+        "before_fix": {
+          "roll_rms_deg": 0.0003893228167181956,
+          "maximum_absolute_roll_deg": 0.002814937249869174,
+          "pitch_yaw_second_difference_rms_deg": [
+            0.09444993928304468,
+            0.24749942493080268
+          ],
+          "minimum_fov": 0.6722259267217978,
+          "iterations": 0,
+          "projected_frames": 0,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        },
+        "after_fix": {
+          "roll_rms_deg": 3.841390617265593e-15,
+          "maximum_absolute_roll_deg": 1.2722218725854067e-14,
+          "pitch_yaw_second_difference_rms_deg": [
+            0.09444994147352224,
+            0.24749943356347173
+          ],
+          "minimum_fov": 0.6722257851569021,
+          "iterations": 0,
+          "projected_frames": 0,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        }
+      }
+    },
+    "052_feedback06": {
+      "video": "dataset/insta360/20260826_195214/PRO_VID_20260826_195214_00_052.mp4",
+      "frame_count": 220,
+      "horizon_off_bitwise_compatible": true,
+      "results": {
+        "raw": {
+          "roll_rms_deg": 11.01681277189078,
+          "maximum_absolute_roll_deg": 18.455628075229594,
+          "pitch_yaw_second_difference_rms_deg": [
+            4.882753631101813,
+            4.829048477550847
+          ]
+        },
+        "horizon_off": {
+          "roll_rms_deg": 10.714433240032168,
+          "maximum_absolute_roll_deg": 16.093584046230802,
+          "pitch_yaw_second_difference_rms_deg": [
+            1.0784350755352667,
+            0.9477104333070486
+          ],
+          "minimum_fov": 0.6064256492308692,
+          "iterations": 70,
+          "projected_frames": 0,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        },
+        "before_fix": {
+          "roll_rms_deg": 3.509434125065482,
+          "maximum_absolute_roll_deg": 7.924800509224426,
+          "pitch_yaw_second_difference_rms_deg": [
+            1.6143305340975775,
+            1.4139275478105209
+          ],
+          "minimum_fov": 0.6009118092071565,
+          "iterations": 104,
+          "projected_frames": 0,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        },
+        "after_fix": {
+          "roll_rms_deg": 3.430927246079238e-15,
+          "maximum_absolute_roll_deg": 2.5444437451708134e-14,
+          "pitch_yaw_second_difference_rms_deg": [
+            1.976057111092077,
+            1.7507485801974303
+          ],
+          "minimum_fov": 0.6000000200052833,
+          "iterations": 115,
+          "projected_frames": 16,
+          "coverage_violation_frames": 0,
+          "fov_floor_violation_frames": 0
+        }
+      }
+    }
+  }
+}
