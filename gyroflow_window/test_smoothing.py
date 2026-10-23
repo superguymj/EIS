@@ -8,8 +8,8 @@ from .math3d import (unit_quaternions, from_rotvec, rotvec, multiply, conjugate,
                      angular_distance, matrices, slerp)
 from .geometry import (PinholeCamera, geometric_fov, coverage_margin, project_to_fov,
                        project_horizon_to_fov)
-from .gyroflow_global import SmoothingConfig, gyroflow_smooth, stabilize_global, horizon_gain
-from .sliding_window import WindowConfig, SlidingWindowStabilizer, stabilize_window
+from .gyroflow_global import SmoothingConfig, gyroflow_smooth, stabilize_global, horizon_gain, zoom_curve
+from .sliding_window import WindowConfig, SlidingWindowStabilizer, stabilize_window, fit_fov_history
 from .synthetic import make_motion
 
 
@@ -117,15 +117,19 @@ def test_no_future_leakage_or_retroactive_mutation(enablehorizon):
     cfg = SmoothingConfig(max_iterations=1, enablehorizon=enablehorizon)
     win = WindowConfig(history=20, emit=6, future=12)
     a, b = SlidingWindowStabilizer(cfg, win), SlidingWindowStabilizer(cfg, win)
-    prefix = 18
-    first_a, first_b = a.push(raw[:prefix])[0], b.push(raw[:prefix])[0]
+    # Inspect a batch that has committed history, exercising the FOV seam fit.
+    prefix = 24
+    first_a, first_b = a.push(raw[:prefix])[-1], b.push(raw[:prefix])[-1]
     saved = first_a.orientations.copy()
+    saved_fov = first_a.fov.copy()
     altered = multiply(from_rotvec(np.tile([1.1, -0.5, 0.8], (len(raw)-prefix,1))), raw[prefix:])
     a.push(raw[prefix:]); a.flush()
     b.push(altered); b.flush()
     assert np.array_equal(first_a.orientations, saved)
     assert np.array_equal(first_a.orientations, first_b.orientations)
-    assert first_a.diagnostics['observed_through'] == 17
+    assert np.array_equal(first_a.fov, saved_fov)
+    assert np.array_equal(first_a.fov, first_b.fov)
+    assert first_a.diagnostics['observed_through'] == prefix - 1
     assert len(a.window_diagnostics) == 0  # production does not retain an unbounded log
     with pytest.raises(RuntimeError):
         a.push(raw[:1])
@@ -154,6 +158,109 @@ def test_input_validation():
         SlidingWindowStabilizer().push([[0,0,0,0]])
     with pytest.raises(ValueError):
         SlidingWindowStabilizer().push([[np.nan,0,0,0]])
+    for invalid in [-1., np.inf, np.nan]:
+        with pytest.raises(ValueError, match='fov_boundary_weight'):
+            WindowConfig(fov_boundary_weight=invalid)
+
+
+def test_fov_history_fit_preserves_feasible_constant_velocity():
+    previous = np.array([0.90, 0.89])
+    candidate = 0.88 - 0.01 * np.arange(12)
+    saved = candidate.copy(), previous.copy()
+    actual, info = fit_fov_history(candidate, previous, np.ones(12), 1000., 0.6)
+    assert info['success']
+    assert np.allclose(actual, candidate, atol=1e-12)
+    assert np.array_equal(candidate, saved[0])
+    assert np.array_equal(previous, saved[1])
+
+
+def test_fov_history_fit_anticipates_drop_without_first_frame_collapse():
+    # First window to see a step 18 frames ahead. The old one-sided release
+    # copies the low envelope target immediately, although geometry allows room.
+    geometric = np.r_[np.full(18, 0.95), np.full(3, 0.6)]
+    target = zoom_curve(geometric, SmoothingConfig(minimum_fov=0.6))
+    history = np.array([0.95, 0.95])
+    actual, info = fit_fov_history(target, history, geometric, 1000., 0.6)
+    assert info['success']
+    assert history[-1] - target[0] > 0.3
+    assert 0 < history[-1] - actual[0] < 0.015
+    assert np.max(np.abs(np.diff(np.r_[history, actual], n=2))) < 0.02
+    assert np.all(actual >= 0.6)
+    assert np.all(actual <= geometric)
+    assert np.all(actual[-3:] == 0.6)
+
+
+@pytest.mark.parametrize('history_count', [1, 2])
+@pytest.mark.parametrize('size', [1, 2, 21, 64])
+def test_fov_history_box_optimality_and_coverage(size, history_count):
+    rng = np.random.default_rng(810 + size + history_count)
+    previous = rng.uniform(0.6, 1., history_count)
+    target = rng.uniform(0.55, 0.85, size)
+    upper = rng.uniform(0.6, 1., size)
+    upper[::5] = 0.6  # Exact fixed bounds must also work.
+    weight = 1000.
+    actual, info = fit_fov_history(target, previous, upper, weight, 0.6)
+    assert info['success']
+    assert np.all(actual >= 0.6)
+    assert np.all(actual <= upper)
+    # Independently form the objective gradient and check box KKT signs.
+    joined = np.r_[previous, actual]
+    acceleration = np.diff(joined, n=2)
+    gradient_full = np.zeros(len(joined))
+    gradient_full[:-2] += acceleration
+    gradient_full[1:-1] -= 2 * acceleration
+    gradient_full[2:] += acceleration
+    gradient = actual - target + weight * gradient_full[history_count:]
+    variable = upper > 0.6
+    interior = variable & (actual > 0.6 + 1e-9) & (actual < upper - 1e-9)
+    at_lower = variable & (actual <= 0.6 + 1e-9)
+    at_upper = variable & (actual >= upper - 1e-9)
+    assert np.max(np.abs(gradient[interior]), initial=0) < 1e-7
+    assert np.min(gradient[at_lower], initial=0) > -1e-7
+    assert np.max(gradient[at_upper], initial=0) < 1e-7
+
+
+def test_fov_history_prioritizes_newly_observed_coverage_and_handles_short_tail():
+    # No amount of history smoothing can safely bridge an unseen immediate drop.
+    actual, info = fit_fov_history(np.array([0.6]), np.array([0.95, 0.95]),
+                                   np.array([0.6]), 1000., 0.6)
+    assert info['success'] and actual[0] == 0.6
+    for size in [0, 1, 9]:
+        actual, info = fit_fov_history(np.ones(size), np.ones(2), np.ones(size), 1000., 1.)
+        assert info['success'] and np.array_equal(actual, np.ones(size))
+
+
+def test_fov_history_solver_failure_has_safe_fallback(monkeypatch):
+    from types import SimpleNamespace
+    from . import sliding_window
+    monkeypatch.setattr(sliding_window, 'lsq_linear',
+                        lambda *args, **kwargs: SimpleNamespace(success=False,
+                                                               x=np.array([np.nan]), nit=1))
+    target = np.array([0.7, 0.9])
+    upper = np.array([0.8, 0.85])
+    actual, info = fit_fov_history(target, np.array([0.8, 0.8]), upper, 1000., 0.6)
+    assert not info['success']
+    assert np.array_equal(actual, [0.7, 0.85])
+
+
+@pytest.mark.parametrize('hard_fov', [False, True])
+def test_fov_history_stream_improves_zoom_without_changing_pose_feedback(hard_fov):
+    raw = make_motion('walking', 183, seconds=5).raw
+    config = SmoothingConfig(minimum_fov=0.6, enablehorizon=True)
+    window = WindowConfig(hard_fov=hard_fov)
+    old = stabilize_window(raw, config, replace(window, fov_boundary_weight=0))
+    new = stabilize_window(raw, config, window)
+    assert np.array_equal(old.orientations, new.orientations)
+    assert np.array_equal(old.geometric_fov, new.geometric_fov)
+    assert old.iterations == new.iterations
+    assert [d['feedback_min'] for d in old.diagnostics['windows']] == [
+        d['feedback_min'] for d in new.diagnostics['windows']]
+    assert np.mean(np.diff(new.fov, n=2)**2) < np.mean(np.diff(old.fov, n=2)**2)
+    assert not any(d['fov_boundary_fallback'] for d in new.diagnostics['windows'])
+    assert np.max(new.fov - new.geometric_fov) <= 1e-12
+    assert coverage_margin(raw, new.orientations, new.fov, PinholeCamera()).min() >= -1e-9
+    if hard_fov:
+        assert new.fov.min() >= config.minimum_fov - 1e-9
 
 
 @pytest.mark.parametrize('enablehorizon', [False, True])
@@ -397,12 +504,19 @@ def test_horizon_bundle_cli(tmp_path):
 
     bundle, source, output = (tmp_path/name for name in ['stabilizer.py', 'input.npy', 'output.npz'])
     build(bundle)
-    raw = np.tile(from_rotvec(np.deg2rad([0., 0., 5.])), (35, 1))
+    raw = make_motion('walking', 52, seconds=1.2).raw
     np.save(source, raw)
     subprocess.run([sys.executable, str(bundle), str(source), '--output', str(output),
-                    '--enablehorizon', '--horizon-up', '0', '2', '0', '--minimum-fov', '0.6'],
+                    '--enablehorizon', '--horizon-up', '0', '2', '0', '--minimum-fov', '0.6',
+                    '--history', '12', '--emit', '5', '--future', '7', '--fov-boundary-weight', '37'],
                    capture_output=True, text=True, check=True)
+    config = SmoothingConfig(enablehorizon=True, horizon_up=(0, 2, 0), minimum_fov=0.6)
+    window = WindowConfig(history=12, emit=5, future=7, fov_boundary_weight=37)
+    expected = stabilize_window(raw, config, window)
+    legacy = stabilize_window(raw, config, replace(window, fov_boundary_weight=0))
+    assert np.max(np.abs(expected.fov - legacy.fov)) > 1e-5
     with np.load(output) as result:
         assert result['orientations'].shape == raw.shape
         assert np.max(np.abs(horizon_error_deg(result['orientations']))) < 1e-8
         assert result['fov'].min() >= 0.6-1e-9
+        assert np.allclose(result['fov'], expected.fov, atol=1e-10)

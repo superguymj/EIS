@@ -1,5 +1,7 @@
 # Gyroflow 滑动窗口：迭代开发与实测结果
 
+`experiments/` ????? Git ???????????????????????????????????????
+
 本文件由 `python -m gyroflow_window.report` 从已完成实验的 CSV 生成。算法细节、接口及边界条件见 [实现说明](gyroflow-sliding-window.md)。
 
 ## 1. 结论与比较口径
@@ -172,12 +174,12 @@
 
 ## 8. 复现、原始证据与适用边界
 
-- [最终逐配置 CSV](../experiments/gyroflow_window/validation_final/metrics.csv)
-- [最终参数、代码 SHA256 与环境](../experiments/gyroflow_window/validation_final/metadata.json)
-- [最终源码快照](../experiments/gyroflow_window/validation_final/source_snapshot/)
-- [最终逐帧输入/输出轨迹 NPZ](../experiments/gyroflow_window/validation_final/trajectories/)
-- [60 fps 补充实验](../experiments/gyroflow_window/robustness_final_60fps/metrics.csv)
-- [短 H/大 E 补充实验](../experiments/gyroflow_window/robustness_final_short_h/metrics.csv)
+- `experiments/gyroflow_window/validation_final/metrics.csv`?最终逐配置 CSV??????
+- `experiments/gyroflow_window/validation_final/metadata.json`?最终参数、代码 SHA256 与环境??????
+- `experiments/gyroflow_window/validation_final/source_snapshot/`?最终源码快照??????
+- `experiments/gyroflow_window/validation_final/trajectories/`?最终逐帧输入/输出轨迹 NPZ??????
+- `experiments/gyroflow_window/robustness_final_60fps/metrics.csv`?60 fps 补充实验??????
+- `experiments/gyroflow_window/robustness_final_short_h/metrics.csv`?短 H/大 E 补充实验??????
 
 ```powershell
 python -m pytest gyroflow_window/test_smoothing.py -q

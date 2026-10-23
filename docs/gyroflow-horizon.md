@@ -1,16 +1,22 @@
 # 水平矫正与 FOV feedback 协同算法
 
-更新日期：2026-10-16。本文对应修复后的源代码与 `dist/gyroflow_sliding_window.py`。
+更新日期：2026-10-19。本文对应修复后的源代码与 `dist/gyroflow_sliding_window.py`；本次文档补充明确修复范围和三轴平滑的取舍，不代表又实现了新的联合优化算法。
 
 本次修改保留 FOV feedback、窗口提交协议和画面覆盖检查。`enablehorizon=True` 时，原有两轮平滑继续接受逐帧反馈；水平步骤生成 roll 接近 0 的目标；接缝拟合后恢复水平目标；最终通过保持水平的可行性搜索修正视线运动。搜索的每个可接受姿态都必须满足原来的 FOV 底线。
 
 本次真实视频实验使用 `minimum_fov=0.6`。库和命令行的默认值仍为 `0.8`，调用时显式传入 `0.6`。没有通过关闭 feedback、关闭 `hard_fov` 或在画图后把 roll 数值写成零来获得结果。
+
+后续版本说明：2026-10-23 增加了 [固定历史 FOV 的衔接平滑](gyroflow-fov-history-smoothing.md)。本文第 6 节和 72 项测试记录对应 horizon 修复阶段；新的缩放拟合会改变 FOV 曲线，不改变这里验证的姿态输出。复现本文历史 FOV 数据时使用 `WindowConfig(fov_boundary_weight=0)`，历史比较脚本已显式设置该参数。
+
+`experiments/` 已整体忽略，本文中的图和数据路径仅指本地产物；复现脚本迁至 `tools/horizon_video/`，不再随实验产物一起忽略。
 
 ## 1. 原问题与修改范围
 
 旧版 `288a63a` 将同一反馈系数 `c` 用在两处：原有滤波的速度阈值，以及水平力度 `h(c)=2c/(1+c)`。开启水平后裁剪需求增大，反馈下降，pitch/yaw 的平滑与水平矫正一起减弱。之后的接缝拟合可能重新引入 roll；最终整姿态 SLERP 投影又会同时撤销视线调整与 roll 矫正。
 
 因此，旧测试中“反馈系数满足公式”和“FOV 不越界”通过，不能说明最终提交的相机姿态已经水平。本次增加了有实际反馈压力的端到端水平验收。
+
+此前实现的缺陷是：水平目标会被反馈耦合、接缝拟合和整姿态回退削弱，最终输出没有达到预期的水平效果，而验收没有完整检查这个输出链路。当前代码已修正这条链路，并记录最终姿态的水平误差和覆盖结果。修复并不等于三轴平滑已经达到最佳平衡；当前策略优先保持水平，尚未提供可调的 roll 与 pitch/yaw 联合优化权重。
 
 | 文件 | 本次职责 |
 |---|---|
@@ -19,10 +25,10 @@
 | [sliding_window.py](../gyroflow_window/sliding_window.py) | 接缝后恢复可观测的水平目标；保留反馈更新；最终选择 horizon 专用投影；记录反馈与残余水平误差 |
 | [test_smoothing.py](../gyroflow_window/test_smoothing.py) | 检查最终 roll、平滑效果、活跃反馈、覆盖、流式协议和单文件一致性 |
 | [build_bundle.py](../gyroflow_window/build_bundle.py) | 更新命令行说明，重新生成交付文件 |
-| [plot_video_angles.py](../experiments/horizon_video/plot_video_angles.py) | 从真实 MP4 导出原始姿态，运行正式窗口算法，保存三轴曲线、CSV、姿态与验证指标 |
-| [compare_horizon.py](../experiments/horizon_video/compare_horizon.py) | 直接读取旧提交的实现，在同一数据、同一 FOV 参数下比较修复前后 |
+| [plot_video_angles.py](../tools/horizon_video/plot_video_angles.py) | 从真实 MP4 导出原始姿态，运行正式窗口算法，保存三轴曲线、CSV、姿态与验证指标 |
+| [compare_horizon.py](../tools/horizon_video/compare_horizon.py) | 直接读取旧提交的实现，在同一数据、同一 FOV 参数下比较修复前后 |
 
-`enablehorizon=False` 的计算路径保持原有行为。本次两段真实视频核对中，关闭开关后的核心、窗口姿态与 FOV 均与旧版逐位一致。
+就本次 horizon 修复而言，`enablehorizon=False` 的计算路径保持原有行为。隔离后续 FOV 拟合后，两段真实视频核对中关闭 horizon 的核心、窗口姿态与 FOV 均与旧版逐位一致。
 
 ## 2. 坐标与配置
 
@@ -129,6 +135,16 @@ threshold_k = 0.95, 0.90, 0.85, 0.80，后续保持 0.80
 
 Global 开启 horizon 后也增加相同的最终覆盖投影。关闭 horizon 时 Global 仍保留原有有限轮次软反馈行为。
 
+### 5.1 水平矫正与三轴平滑的取舍（trade-off）
+
+在固定相机模型和 `minimum_fov` 下，roll 矫正与 pitch/yaw 平滑共享有限的裁切余量。余量充足时可以同时改善；约束吃紧时，要求 roll 更接近 0，可能迫使 pitch/yaw 更多跟随原始运动。这个取舍来自三轴旋转共同影响画面覆盖，并不意味着每个场景都必须牺牲某一轴。
+
+当前实现采用水平优先的可行路径：只要原始视线存在可行的水平锚点，搜索就保持 roll 为 0，主要退让视线平滑量。052 在 FOV 下限 0.6 时展示了这种代价，具体指标见第 6.2 节。与此同时，最终投影逐帧决定姿态，未联合约束投影后的时间连续性；它也可能增加曲线粗糙度。因此，不能把所有尖峰都归为不可避免的物理取舍，也不能仅以 roll 为零判定整体防抖通过。
+
+后续改进方向是保留 feedback 和覆盖硬约束，将 pitch/yaw 平滑、roll 接近 0 以及 roll 自身的时间平滑共同纳入目标。允许少量、缓慢变化的残余倾斜，以换取更平顺的视线运动。这个可调的联合优化目前尚未实现，现有接口也没有对应权重参数。
+
+评估该改进时，应在同一视频、FOV 下限和窗口参数下，同时比较水平误差、三轴时间粗糙度与覆盖违例，使用最终提交的四元数生成曲线，不对画图数据另做平滑或强制归零。
+
 ## 6. 真实视频实验
 
 ### 6.1 数据与测量
@@ -163,17 +179,17 @@ Gyroflow 仅从原始 MP4 提供逐帧原始相机姿态；平滑姿态来自本
 | 052 修复前开启，FOV=0.6 | 1.614331 | 1.413928 |
 | 052 修复后开启，FOV=0.6 | 1.976057 | 1.750749 |
 
-046 保留原有 pitch/yaw 平滑，roll 达到水平。052 的 pitch/yaw 相对原始仍明显平滑，但在同样裁剪预算下，相比旧版允许残余 roll 的结果更粗糙；这是压力场景为完整水平付出的视线平滑代价，不能宣称三个轴在所有视频上都同时改善。该指标也不等于相对于真实运动轨迹的误差。
+046 保留原有 pitch/yaw 平滑，roll 达到水平。052 的 pitch/yaw 相对原始仍明显平滑，但在同样裁剪预算下，相比旧版允许残余 roll 的结果更粗糙。这说明当前水平优先策略存在视线平滑代价，不能宣称三个轴在所有视频上都同时改善；这组结果也没有将裁切约束的必然取舍与逐帧投影带来的额外粗糙度分别量化。该指标不等于相对于真实运动轨迹的误差。
 
 这是姿态算法与针孔覆盖验证；尚未将这些输出四元数接入真实镜头标定、滚动快门和视频重映射后进行逐像素黑边验收。
 
 ### 6.3 图和数据
 
-- 046：[完整三轴曲线](../experiments/horizon_video/046/pitch_yaw_roll.png)、[局部放大](../experiments/horizon_video/046/pitch_yaw_roll_zoom.png)、[CSV](../experiments/horizon_video/046/angles.csv)、[参数与验证](../experiments/horizon_video/046/metadata.json)。
-- 052：[完整三轴曲线](../experiments/horizon_video/052_feedback06/pitch_yaw_roll.png)、[局部放大](../experiments/horizon_video/052_feedback06/pitch_yaw_roll_zoom.png)、[CSV](../experiments/horizon_video/052_feedback06/angles.csv)、[参数与验证](../experiments/horizon_video/052_feedback06/metadata.json)。
-- [同参数旧版 / 新版 / 关闭开关比较数据](../experiments/horizon_video/comparison_feedback06.json)。
+- 046：`experiments/horizon_video/046/pitch_yaw_roll.png`?完整三轴曲线??????、`experiments/horizon_video/046/pitch_yaw_roll_zoom.png`?局部放大??????、`experiments/horizon_video/046/angles.csv`?CSV??????、`experiments/horizon_video/046/metadata.json`?参数与验证??????。
+- 052：`experiments/horizon_video/052/pitch_yaw_roll.png`?完整三轴曲线??????、`experiments/horizon_video/052/pitch_yaw_roll_zoom.png`?局部放大??????、`experiments/horizon_video/052/angles.csv`?CSV??????、`experiments/horizon_video/052/metadata.json`?参数与验证??????。
+- `experiments/horizon_video/comparison_feedback06.json`?同参数旧版 / 新版 / 关闭开关比较数据??????。
 
-`experiments/horizon_video/052/` 保留了旧版 FOV=0.8 的失败图与历史诊断，不能作为修复后结果。`diagnose_horizon.py` 固定读取旧提交，仅用于复现原问题。
+当前 `experiments/horizon_video/052/` 保存 horizon 修复后 FOV=0.6 的数据；参数以该目录的 `metadata.json` 为准。`diagnose_horizon.py` 固定读取旧提交，仅用于复现原问题，其历史诊断不能代替当前结果。
 
 ## 7. 使用与复现
 
@@ -199,12 +215,12 @@ python dist/gyroflow_sliding_window.py input.npy --output output.npz --fps 30 --
 真实数据位于本地 `dataset/`，图的复现需要其中的 MP4 与便携 Gyroflow：
 
 ```powershell
-python experiments/horizon_video/plot_video_angles.py
-python experiments/horizon_video/plot_video_angles.py --video dataset/insta360/20260826_195214/PRO_VID_20260826_195214_00_052.mp4 --output experiments/horizon_video/052_feedback06 --minimum-fov 0.6
-python experiments/horizon_video/compare_horizon.py
+python tools/horizon_video/plot_video_angles.py
+python tools/horizon_video/plot_video_angles.py --video dataset/insta360/20260826_195214/PRO_VID_20260826_195214_00_052.mp4 --output experiments/horizon_video/052 --minimum-fov 0.6
+python tools/horizon_video/compare_horizon.py
 ```
 
-第一条默认处理 046、FOV=0.6，同时生成全程与固定时间段局部放大图。旧版比较脚本还需要 Git 中存在 `288a63a`。
+第一条默认处理 046、FOV=0.6，同时生成全程与固定时间段局部放大图。绘图脚本使用当前窗口默认配置，包含新增的 FOV 拟合；历史比较脚本关闭该拟合以隔离 horizon 修改，并需要 Git 中存在 `288a63a`。
 
 ## 8. 验收与兼容性
 
@@ -221,4 +237,4 @@ python -m pytest gyroflow_window/test_smoothing.py -q
 - 保留朝天、朝地、半圈、参考归一化、旋转与符号不变性测试。
 - 保留拆包一致性、历史不可变、前瞻预算、短片段、EOF、单文件有无 Numba 与 CLI 一致性测试。
 
-关闭开关的真实数据兼容性、修复前后同参数比较由 `compare_horizon.py` 中的逐位断言额外检查。实际生成的 `dist` 文件也通过命令行处理这两段真实输入，姿态、FOV、几何 FOV 均与源模块逐位一致，记录于 [bundle_parity.json](../experiments/horizon_video/bundle_parity.json)。原有关闭 horizon 的合成实验报告继续有效；开启后的效果应以上面的新验收与结果为准。
+关闭开关的真实数据兼容性、修复前后同参数比较由 `compare_horizon.py` 中的逐位断言额外检查。实际生成的 `dist` 文件也通过命令行处理这两段真实输入，姿态、FOV、几何 FOV 均与源模块逐位一致，记录于 `experiments/horizon_video/bundle_parity.json`?bundle_parity.json??????。原有关闭 horizon 的合成实验报告继续有效；开启后的效果应以上面的新验收与结果为准。

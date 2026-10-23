@@ -20,6 +20,8 @@ def main():
     parser.add_argument("--history", type=int, default=60)
     parser.add_argument("--emit", type=int, default=6)
     parser.add_argument("--future", type=int, default=15)
+    parser.add_argument("--fov-boundary-weight", type=float, default=1000.0,
+                        help="FOV seam acceleration penalty at 30 fps; 0 restores legacy zoom")
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
     parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
@@ -36,7 +38,8 @@ def main():
         raw = loaded
     config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov,
                              enablehorizon=args.enablehorizon, horizon_up=args.horizon_up)
-    window = WindowConfig(history=args.history, emit=args.emit, future=args.future)
+    window = WindowConfig(history=args.history, emit=args.emit, future=args.future,
+                          fov_boundary_weight=args.fov_boundary_weight)
     result = stabilize_window(raw, config, window, PinholeCamera(args.diagonal_fov))
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

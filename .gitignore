@@ -1,5 +1,7 @@
 # Local input data and root-level hidden files/directories.
 /dataset/
+# Local experiment inputs, results, plots, and source snapshots.
+/experiments/
 /.*
 !/.gitignore
 

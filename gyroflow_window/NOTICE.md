@@ -10,9 +10,10 @@ translations of Gyroflow commit `2331ebb3c253fc7cf357642518b0c8bf2937f815`.
   generated single-file distribution carry the same SPDX identifier.
   See the accompanying LICENSE file for the full license text.
 
-The synthetic pinhole geometry, bounded streaming adapter, boundary fitting,
-tail prediction, optional coverage-constrained horizon correction, synthetic data,
-and experiments are additions in this workspace.
+The synthetic pinhole geometry, bounded streaming adapter, pose boundary fitting,
+coverage-constrained FOV history fitting, tail prediction, optional
+coverage-constrained horizon correction, synthetic data, and experiments are
+additions in this workspace.
 They are not an official Gyroflow implementation of streaming stabilization.
 
 The baseline supports constant parameters and the non-per-axis default algorithm.

@@ -508,7 +508,7 @@ def stabilize_global(orientations, config=None, camera=None):
     return StabilizationResult(smooth, fov, geometric, iterations, info)
 
 
-# Source: sliding_window.py; SHA256: 037facb7f6d51036386c807d06b94ce54f13ed34a803a0a8a49ac6871604ec92
+# Source: sliding_window.py; SHA256: 37345e62c2bcfb002ba804bc2f304c195ffa6e652d23683dc8e5edf20fd70eaf
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Bounded-lookahead quaternion stabilization with immutable committed history.
@@ -523,6 +523,7 @@ from functools import lru_cache
 from time import perf_counter
 import numpy as np
 from scipy.linalg import cholesky_banded, cho_solve_banded
+from scipy.optimize import lsq_linear
 
 
 
@@ -541,6 +542,8 @@ class WindowConfig:
     stable_distance_scale: bool = False
     initial_distance_deg: float = 3.0
     hard_fov: bool = True
+    # Second-difference penalty at 30 fps; zero preserves legacy FOV output.
+    fov_boundary_weight: float = 1000.0
     # Ablation only: disable boundary fit / predictor using weights of zero.
 
     def __post_init__(self):
@@ -548,7 +551,8 @@ class WindowConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < lower:
                 raise ValueError(f'{name} must be an integer >= {lower}')
-        for name in ['boundary_weight', 'prediction_seconds', 'prediction_guard_seconds']:
+        for name in ['boundary_weight', 'prediction_seconds', 'prediction_guard_seconds',
+                     'fov_boundary_weight']:
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f'{name} must be finite and nonnegative')
@@ -601,6 +605,53 @@ def fit_fixed_history(candidate, history, weight):
     rhs = -weight * (difference.T @ acceleration)
     correction = cho_solve_banded((factor, True), rhs, check_finite=False)
     return unit_quaternions(multiply(from_rotvec(correction), candidate))
+
+
+@lru_cache(maxsize=128)
+def _fov_boundary_system(size, history_count, weight):
+    difference = np.diff(np.eye(size + history_count), n=2, axis=0)
+    scaled = np.sqrt(weight) * difference
+    return np.vstack([np.eye(size), scaled[:, history_count:]]), scaled[:, :history_count]
+
+
+def fit_fov_history(candidate, history, geometric, weight, minimum_fov=0.0):
+    """Fit pending FOV values to immutable history under framewise coverage.
+
+    Minimize ||f-candidate||^2 + weight*||D2([history[-2:], f])||^2,
+    subject to minimum_fov <= f <= geometric. The last two committed values
+    set both the value and slope at the seam; only pending frames are variables.
+    This is a soft acceleration penalty, not a promise of exact C1 continuity.
+    A newly observed coverage limit can still require an immediate crop.
+
+    Returns (fov, info). A solver failure uses the bounded candidate. Bounds
+    that coincide (including full-frame output) are eliminated before solving.
+    """
+    candidate = np.asarray(candidate, dtype=float)
+    upper = np.asarray(geometric, dtype=float)
+    # Hard projection may leave roundoff below the requested floor. Coverage
+    # takes precedence over increasing FOV past the actual geometric bound.
+    lower = np.minimum(minimum_fov, upper)
+    target = np.clip(candidate, lower, upper)
+    info = {'success': True, 'iterations': 0}
+    previous = np.asarray(history[-2:], dtype=float)
+    if weight <= 0 or len(target) == 0 or len(previous) == 0:
+        return target, info
+    matrix, history_matrix = _fov_boundary_system(len(target), len(previous), float(weight))
+    rhs = np.concatenate([candidate, -history_matrix @ previous])
+    fixed = upper == lower
+    free = ~fixed
+    result = lower.copy()
+    if free.any():
+        solution = lsq_linear(
+            matrix[:, free], rhs - matrix[:, fixed] @ result[fixed],
+            bounds=(lower[free], upper[free]), method='bvls', tol=1e-11,
+            max_iter=max(50, 5 * len(target)))
+        info = {'success': bool(solution.success and np.isfinite(solution.x).all()),
+                'iterations': int(solution.nit)}
+        if not info['success']:
+            return target, info
+        result[free] = solution.x
+    return np.clip(result, lower, upper), info
 
 
 def _fit_trend(observed, fps, seconds):
@@ -761,6 +812,15 @@ class SlidingWindowStabilizer:
                 state = min(zoom[i], (1-alpha)*state + alpha*zoom[i])
                 zoom[i] = state
         final_geometry = geometry[history_count:]
+        # The envelope/fast-attack result is a target, not the safety bound.
+        # Use actual geometric room to join the committed FOV value and slope.
+        # fps^4 keeps the acceleration penalty comparable across sample rates.
+        fov_fit = {'success': True, 'iterations': 0}
+        if window.fov_boundary_weight > 0:
+            zoom, fov_fit = fit_fov_history(
+                zoom, self._history_fov, final_geometry,
+                window.fov_boundary_weight * (config.fps / 30.0)**4,
+                config.minimum_fov if window.hard_fov else 0.0)
 
         committed_poses = pending[:commit_count].copy()
         committed_fov = zoom[:commit_count].copy()
@@ -777,6 +837,8 @@ class SlidingWindowStabilizer:
             'projected_frames': int(np.sum(projected[:commit_count])),
             'feedback_min': float(np.min(feedback[history_count:history_count+commit_count])),
             'feedback_mean': float(np.mean(feedback[history_count:history_count+commit_count])),
+            'fov_boundary_iterations': fov_fit['iterations'],
+            'fov_boundary_fallback': not fov_fit['success'],
             'distance_scale_deg': float(np.rad2deg(self._distance_scale)),
             'milliseconds': (perf_counter()-started)*1000,
             'eof': eof,
@@ -834,6 +896,8 @@ def main():
     parser.add_argument("--history", type=int, default=60)
     parser.add_argument("--emit", type=int, default=6)
     parser.add_argument("--future", type=int, default=15)
+    parser.add_argument("--fov-boundary-weight", type=float, default=1000.0,
+                        help="FOV seam acceleration penalty at 30 fps; 0 restores legacy zoom")
     parser.add_argument("--minimum-fov", type=float, default=0.8)
     parser.add_argument("--diagonal-fov", type=float, default=100.0)
     parser.add_argument("--enablehorizon", "--enable-horizon", action="store_true",
@@ -850,7 +914,8 @@ def main():
         raw = loaded
     config = SmoothingConfig(fps=args.fps, minimum_fov=args.minimum_fov,
                              enablehorizon=args.enablehorizon, horizon_up=args.horizon_up)
-    window = WindowConfig(history=args.history, emit=args.emit, future=args.future)
+    window = WindowConfig(history=args.history, emit=args.emit, future=args.future,
+                          fov_boundary_weight=args.fov_boundary_weight)
     result = stabilize_window(raw, config, window, PinholeCamera(args.diagonal_fov))
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
